@@ -1,0 +1,13 @@
+[project]
+name = "news-updater"
+version = "0.1.0"
+description = "Spoken news briefing at Windows logon"
+requires-python = ">=3.12"
+dependencies = [
+    "requests",
+    "python-dotenv",
+    "styletts2",
+]
+
+[tool.uv]
+package = false

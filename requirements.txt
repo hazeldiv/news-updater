@@ -1,0 +1,6 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchaudio
+requests
+python-dotenv
+styletts2
