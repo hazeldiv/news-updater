@@ -24,9 +24,11 @@ SYSTEM_PROMPT = f"""You write a short spoken news briefing for a text-to-speech 
 
 Report ANY new model or version release from these labs: Qwen, DeepSeek, GLM (Zhipu), Kimi (Moonshot), and Claude (Anthropic). For [OI] GPT and Google Gemini, report MAJOR versions only (for example GPT-6 or Gemini 3); ignore sub-models, minor updates, and point releases.
 
+You are given an ALREADY ANNOUNCED MODEL RELEASES list. Never report a release that is the same model as any entry on that list, even if the headline uses a different name or wording. Only report a release that is genuinely new. Never report a release that came out more than {config.MODEL_HISTORY_DAYS} days ago.
+
 For markets, only mention an entry when it is marked "first sighting" or when its move is at least {config.PRICE_THRESHOLD_PCT:g} percent. All percentages and prices are already computed for you; never calculate anything yourself. Narrate them naturally, for example "up 6.2 percent to 2650 dollars". When an entry includes a "since" time, always state that period in the narration, for example "bitcoin is up 6.2 percent since about 2 hours ago, now 74000 dollars".
 
-Output ONLY a JSON object of the form {{"narration": "..."}}. The narration must be plain spoken English, under {config.MAX_WORDS} words, with no URLs, no markdown, and no emoji. If nothing qualifies, output exactly {{"narration": null}}."""
+Output ONLY a JSON object of the form {{"narration": "...", "releases": [{{"name": "...", "release_date": "YYYY-MM-DD"}}]}}. The narration must be plain spoken English, under {config.MAX_WORDS} words, with no URLs, no markdown, and no emoji. Use a specific full model name with vendor and version in each release entry. If nothing qualifies, output exactly {{"narration": null, "releases": []}}."""
 
 
 def now_iso():
@@ -34,7 +36,7 @@ def now_iso():
 
 
 def _empty_state():
-    return {"prices": {}, "seen_news": {}, "last_run": None}
+    return {"prices": {}, "seen_news": {}, "models": {}, "last_run": None}
 
 
 def load_state():
@@ -51,6 +53,8 @@ def load_state():
             state["prices"] = {}
         if not isinstance(state["seen_news"], dict):
             state["seen_news"] = {}
+        if not isinstance(state["models"], dict):
+            state["models"] = {}
         return state
     except Exception:
         try:
@@ -101,6 +105,47 @@ def prune_seen(state, days=SEEN_NEWS_TTL_DAYS):
         if seen_at >= cutoff:
             kept[key] = timestamp
     state["seen_news"] = kept
+
+
+def _normalize(text):
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def _known_pattern(name):
+    name = _normalize(name)
+    if not name:
+        return None
+    return re.compile(r"(?<![a-z0-9.])" + re.escape(name) + r"(?![a-z0-9.])")
+
+
+def filter_known_models(news_items, models):
+    patterns = [p for p in (_known_pattern(name) for name in models) if p]
+    if not patterns:
+        return list(news_items)
+    kept = []
+    for item in news_items:
+        title = _normalize(item["title"])
+        if any(pattern.search(title) for pattern in patterns):
+            log.info("skipping known model release: %s", item["title"])
+            continue
+        kept.append(item)
+    return kept
+
+
+def recent_models(models, days=config.MODEL_HISTORY_DAYS):
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    recent = {}
+    for name, record in models.items():
+        announced = record.get("announced_at") if isinstance(record, dict) else None
+        try:
+            announced_at = datetime.fromisoformat(announced)
+        except (TypeError, ValueError):
+            continue
+        if announced_at.tzinfo is None:
+            announced_at = announced_at.replace(tzinfo=timezone.utc)
+        if announced_at >= cutoff:
+            recent[name] = record
+    return recent
 
 
 def fetch_hn_news():
@@ -246,30 +291,32 @@ def build_market_events(current_state, prices):
     return events
 
 
-def narrate(news_items, events):
+def narrate(news_items, events, models):
     if not config.OPENROUTER_API_KEY:
         raise LLMError("OPENROUTER_API_KEY is not set")
     if not config.OPENROUTER_MODELS:
         raise LLMError("OPENROUTER_MODELS is not set")
-    user_message = _build_user_message(news_items, events)
+    user_message = _build_user_message(news_items, events, models)
     last_error = None
     for model in config.OPENROUTER_MODELS:
         try:
             content = _call_model(model, user_message)
-            narration = _parse_narration(content)
+            log.info("model %s raw response: %s", model, content)
+            narration, releases = _parse_response(content)
             log.info(
-                "model %s responded (%s)",
+                "model %s responded (%s, %d releases)",
                 model,
                 "narration" if narration else "null",
+                len(releases),
             )
-            return narration
+            return {"narration": narration, "releases": releases}
         except Exception as exc:
             last_error = exc
             log.warning("model %s failed: %s", model, exc)
     raise LLMError(f"all OpenRouter models failed: {last_error}")
 
 
-def _build_user_message(news_items, events):
+def _build_user_message(news_items, events, models):
     lines = []
     if news_items:
         lines.append("NEW MODEL RELEASES (candidates):")
@@ -277,6 +324,15 @@ def _build_user_message(news_items, events):
             lines.append(f"- {item['title']} (source: {item.get('url', '')})")
     else:
         lines.append("NEW MODEL RELEASES: none")
+    lines.append("")
+    recent = recent_models(models)
+    if recent:
+        lines.append("ALREADY ANNOUNCED MODEL RELEASES (do not report again):")
+        for name, record in recent.items():
+            release_date = record.get("release_date") or "unknown"
+            lines.append(f"- {name} (released {release_date})")
+    else:
+        lines.append("ALREADY ANNOUNCED MODEL RELEASES: none")
     lines.append("")
     if events:
         lines.append("MARKET MOVES (already computed, report as given):")
@@ -331,7 +387,7 @@ def _call_model(model, user_message):
     return content
 
 
-def _parse_narration(content):
+def _parse_response(content):
     cleaned = content.strip()
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```[a-zA-Z]*\s*", "", cleaned)
@@ -347,9 +403,24 @@ def _parse_narration(content):
             except json.JSONDecodeError:
                 data = None
     if not isinstance(data, dict):
-        return None
+        return None, []
     narration = data.get("narration")
-    if narration is None:
-        return None
-    narration = str(narration).strip()
-    return narration or None
+    if narration is not None:
+        narration = str(narration).strip() or None
+    return narration, _parse_releases(data.get("releases"))
+
+
+def _parse_releases(raw):
+    releases = []
+    if not isinstance(raw, list):
+        return releases
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip()
+        if not name:
+            continue
+        releases.append(
+            {"name": name, "release_date": str(entry.get("release_date") or "").strip()}
+        )
+    return releases

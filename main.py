@@ -5,6 +5,7 @@ import os
 import audio
 import config
 import news
+import overlay
 
 log = logging.getLogger("news-updater")
 
@@ -16,23 +17,30 @@ def run_briefing(no_play):
     items = news.fetch_hn_news()
     prices = news.fetch_market_prices()
 
-    candidates = [
+    fresh = [
         item
         for item in items
         if news.title_hash(item["title"]) not in current_state["seen_news"]
     ]
+    candidates = news.filter_known_models(fresh, current_state["models"])
     events = news.build_market_events(current_state, prices)
-    log.info("candidates: %d news, %d market events", len(candidates), len(events))
+    log.info(
+        "candidates: %d news (%d fresh), %d market events",
+        len(candidates),
+        len(fresh),
+        len(events),
+    )
 
-    narration = None
+    result = {"narration": None, "releases": []}
     if candidates or events:
-        narration = news.narrate(candidates, events)
+        result = news.narrate(candidates, events, current_state["models"])
+    narration = result["narration"]
     spoken = narration or config.NO_NEWS_MESSAGE
 
     audio_path = audio.synthesize(spoken)
 
     timestamp = news.now_iso()
-    for item in candidates:
+    for item in fresh:
         current_state["seen_news"][news.title_hash(item["title"])] = timestamp
     if narration:
         for event in events:
@@ -41,6 +49,12 @@ def run_briefing(no_play):
                 "price": event["price"],
                 "announced_at": timestamp,
                 "source": event["source"],
+            }
+        for release in result["releases"]:
+            current_state["models"][release["name"]] = {
+                "name": release["name"],
+                "release_date": release["release_date"],
+                "announced_at": timestamp,
             }
     current_state["last_run"] = timestamp
     news.save_state(current_state)
@@ -53,6 +67,7 @@ def run_briefing(no_play):
     audio.wait_for_activity()
     audio.play_wav(audio_path)
     log.info("playback finished")
+    overlay.show(bool(narration), audio_path)
     return 0
 
 
