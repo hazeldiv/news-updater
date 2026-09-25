@@ -362,7 +362,6 @@ def _call_model(model, user_message):
             {"role": "user", "content": user_message},
         ],
         "temperature": 0.3,
-        "max_tokens": 500,
         "response_format": {"type": "json_object"},
     }
     headers = {
@@ -381,33 +380,44 @@ def _call_model(model, user_message):
     choices = response.json().get("choices") or []
     if not choices:
         raise LLMError("empty choices")
-    content = (choices[0].get("message") or {}).get("content") or ""
+    choice = choices[0]
+    if choice.get("finish_reason") == "length":
+        raise LLMError("response truncated (finish_reason=length)")
+    content = (choice.get("message") or {}).get("content") or ""
     if not content.strip():
         raise LLMError("empty content")
     return content
 
 
 def _parse_response(content):
-    cleaned = content.strip()
+    cleaned = _strip_reasoning(content.strip())
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```[a-zA-Z]*\s*", "", cleaned)
         cleaned = re.sub(r"\s*```$", "", cleaned)
-    data = None
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-        if match:
-            try:
-                data = json.loads(match.group(0))
-            except json.JSONDecodeError:
-                data = None
+    data = _load_json(cleaned)
     if not isinstance(data, dict):
-        return None, []
+        raise LLMError("no JSON object in response")
     narration = data.get("narration")
     if narration is not None:
         narration = str(narration).strip() or None
     return narration, _parse_releases(data.get("releases"))
+
+
+def _strip_reasoning(text):
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
+def _load_json(cleaned):
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if not match:
+            return None
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
 
 
 def _parse_releases(raw):

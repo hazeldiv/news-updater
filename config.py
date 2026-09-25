@@ -59,7 +59,7 @@ OPENROUTER_MODELS = [
     for model in os.getenv("OPENROUTER_MODELS", "").split(",")
     if model.strip()
 ]
-MODEL_TIMEOUT = 60
+MODEL_TIMEOUT = 180
 
 POLL_INTERVAL = 0.7
 IDLE_RESET = 60
